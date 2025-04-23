@@ -1,0 +1,228 @@
+#!/bin/bash
+
+# Build Airgap
+
+set -vx
+
+# Error function
+function error() {
+  echo -e "$@" >&2
+  exit 1
+}
+
+# Retry helm command in case of sporadic issue
+function RunHelmCmdWithRetry() {
+  # Wait for a maximum of 1 minute
+  for ((i = 0; i < 60; i++)); do
+    # If helm command is OK then we simply return (exit the function)
+    helm $* && return
+
+    # Wait a little
+    sleep 5
+  done
+
+  # If we are here then an error happened!
+  exit 1
+}
+
+# Retry skopeo command in case of sporadic issue
+function RunSkopeoCmdWithRetry() {
+  CMD=$*
+
+  # Wait for a maximum of 1 minute
+  for ((i = 0; i < 60; i++)); do
+    # If skopeo command is OK then we simply return (exit the function)
+    ERRMSG=$(skopeo ${CMD} 2>&1 >/dev/null) && return
+
+    # If resource access is denied retry with local access
+    case ${ERRMSG} in
+    *requested\ access\ to\ the\ resource\ is\ denied*)
+      CMD=${CMD/docker:\/\//docker-daemon:}
+      ;;
+    *Storing\ signatures\ for\ docker\ tar\ files\ is\ not\ supported*)
+      CMD=${CMD/copy/copy --remove-signatures}
+      ;;
+    esac
+
+    # Wait a little
+    sleep 5
+  done
+
+  # If we are here then an error happened!
+  exit 1
+}
+
+# Variable(s)
+K3S_UPSTREAM_VERSION=$1
+CERT_MANAGER_VERSION=$2
+RANCHER_CHANNEL=$3
+RANCHER_VERSION=$4
+K3S_DOWNSTREAM_VERSION=$5
+KUBEWARDEN_VERSION=$6
+DEPLOY_AIRGAP_SCRIPT=$(realpath ../scripts/deploy-airgap)
+OPT_RANCHER="${HOME}/airgap_rancher"
+REPO_SERVER="rancher-manager.test:5000"
+
+# Format K8s version
+TMP_VER=${K3S_UPSTREAM_VERSION/+*/}
+K8S_UPSTREAM_VERSION=${TMP_VER/v/}
+TMP_VER=${K3S_DOWNSTREAM_VERSION/+*/}
+K8S_DOWNSTREAM_VERSION=${TMP_VER/v/}
+
+# Create directories
+mkdir -p ${OPT_RANCHER}/{k3s_${K8S_UPSTREAM_VERSION},k3s_${K8S_DOWNSTREAM_VERSION},helm} ${OPT_RANCHER}/images/registry
+
+# Install packages
+sudo zypper --no-refresh -n in skopeo yq
+
+# Add rancher manager in /etc/hosts
+sudo sh -c "echo '192.168.122.102 ${REPO_SERVER%:*}' >> /etc/hosts"
+
+# Download k3s and rancher
+for k8s_ver in ${K3S_UPSTREAM_VERSION}:${K8S_UPSTREAM_VERSION} ${K3S_DOWNSTREAM_VERSION}:${K8S_DOWNSTREAM_VERSION}; do
+  K3S_URL=https://github.com/k3s-io/k3s/releases/download/${k8s_ver%:*}
+  for i in k3s-airgap-images-amd64.tar.zst k3s; do
+    curl -sL ${K3S_URL}/${i} -o ${OPT_RANCHER}/k3s_${k8s_ver#*:}/${i}
+
+    # Get the install script
+    curl -sfL https://get.k3s.io -o ${OPT_RANCHER}/k3s_${k8s_ver#*:}/install.sh
+
+    # Get the airgap deploy script
+    cp ${DEPLOY_AIRGAP_SCRIPT} ${OPT_RANCHER}/k3s_${k8s_ver#*:}
+  done
+done
+
+# Get Helm Charts
+cd ${OPT_RANCHER}/helm/
+
+# Define Rancher Manager repos depending of the needed version
+case ${RANCHER_CHANNEL} in
+prime)
+  RANCHER_CHART_REPO="https://charts.rancher.com/server-charts/prime"
+  ;;
+prime-optimus)
+  RANCHER_CHART_REPO="https://charts.optimus.rancher.io/server-charts/latest"
+  RANCHER_IMAGES_REPO="stgregistry.suse.com"
+  ;;
+prime-optimus-alpha)
+  RANCHER_CHART_REPO="https://charts.optimus.rancher.io/server-charts/alpha"
+  RANCHER_IMAGES_REPO="stgregistry.suse.com"
+  ;;
+alpha | latest | stable)
+  RANCHER_CHART_REPO="https://releases.rancher.com/server-charts/${RANCHER_CHANNEL}"
+  ;;
+*)
+  error "Rancher channel '${RANCHER_CHANNEL}' unknown!"
+  ;;
+esac
+
+# Add repos
+RunHelmCmdWithRetry repo add jetstack https://charts.jetstack.io >/dev/null 2>&1
+RunHelmCmdWithRetry repo add rancher-${RANCHER_CHANNEL} ${RANCHER_CHART_REPO} >/dev/null 2>&1
+RunHelmCmdWithRetry repo update >/dev/null 2>&1
+
+# Get CertManager charts
+[[ "${CERT_MANAGER_VERSION}" == "latest" ]] &&
+  unset VER_OPT ||
+  VER_OPT="--version ${CERT_MANAGER_VERSION}"
+RunHelmCmdWithRetry pull ${VER_OPT} jetstack/cert-manager >/dev/null 2>&1
+
+# Get CertManager version
+CERT_MANAGER_VERSION=$(ls cert-manager-*.tgz 2>/dev/null)
+CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION#cert-manager-*}
+CERT_MANAGER_VERSION=${CERT_MANAGER_VERSION%.*}
+
+# Get Rancher charts
+[[ "${RANCHER_CHANNEL}" =~ (alpha|latest|optimus) ]] &&
+  DEVEL="--devel" ||
+  unset DEVEL
+[[ "${RANCHER_VERSION}" == "latest" ]] &&
+  unset VER_OPT ||
+  VER_OPT="--version ${RANCHER_VERSION}"
+RunHelmCmdWithRetry pull ${DEVEL} ${VER_OPT} rancher-${RANCHER_CHANNEL}/rancher >/dev/null 2>&1
+
+# Get Elemental charts
+[[ "${ELEMENTAL_REPO}" =~ (/dev/|/staging/) ]] &&
+  DEVEL="--devel" ||
+  unset DEVEL
+for i in elemental-operator-chart elemental-operator-crds-chart; do
+  RunHelmCmdWithRetry pull ${DEVEL} ${ELEMENTAL_REPO}/${i} >/dev/null 2>&1
+done
+
+# Get Rancher Manager version if not already set
+if [[ -z "${RANCHER_VERSION}" || "${RANCHER_VERSION}" == "latest" ]]; then
+  RANCHER_VERSION=$(ls rancher-*.tgz 2>/dev/null)
+  RANCHER_VERSION=${RANCHER_VERSION#rancher-*}
+  RANCHER_VERSION=${RANCHER_VERSION%.*}
+fi
+
+# Get the Elemental repositories
+ELEMENTAL_AIRGAP_REPO=https://raw.githubusercontent.com/rancher/elemental-operator/main/scripts
+ELEMENTAL_AIRGAP_SCRIPT=elemental-airgap.sh
+curl -sOL ${ELEMENTAL_AIRGAP_REPO}/${ELEMENTAL_AIRGAP_SCRIPT}
+bash ${ELEMENTAL_AIRGAP_SCRIPT} -d -r ${REPO_SERVER} -sa -ac ${ELEMENTAL_VERSION} || exit 1
+rm -f ${ELEMENTAL_AIRGAP_SCRIPT}
+
+# Get container images
+cd ${OPT_RANCHER}/images/
+
+# Rancher image list
+[[ "${RANCHER_CHANNEL}" =~ prime ]] &&
+  RANCHER_REPO=https://prime.ribs.rancher.io/rancher/v${RANCHER_VERSION} ||
+  RANCHER_REPO=https://github.com/rancher/rancher/releases/download/v${RANCHER_VERSION}
+RANCHER_IMAGES_FILE=rancher-images.txt
+curl -sOL ${RANCHER_REPO}/${RANCHER_IMAGES_FILE}
+
+# Rancher image file should not be empty
+if $(grep -iq 'not found' ${RANCHER_IMAGES_FILE}) || [[ ! -s ${RANCHER_IMAGES_FILE} ]]; then
+  error "ERROR: file ${RANCHER_IMAGES_FILE} is empty or not found!"
+fi
+
+# Fleet should be present in the file, otherwise no need to go further!
+if ! $(grep -iq 'fleet' ${RANCHER_IMAGES_FILE}); then
+  error "ERROR: fleet is not found in file ${RANCHER_IMAGES_FILE}!"
+fi
+
+# CertManager image list
+CERT_IMAGES_FILE=cert-manager-images.txt
+RunHelmCmdWithRetry template ${OPT_RANCHER}/helm/cert-manager-${CERT_MANAGER_VERSION}.tgz |
+  awk '$1 ~ /image:/ {print $2}' |
+  sed s/\"//g >${CERT_IMAGES_FILE}
+
+# Elemental image list
+ELEMENTAL_IMAGES_FILE=elemental-images.txt
+mv -f ${OPT_RANCHER}/helm/${ELEMENTAL_IMAGES_FILE} .
+
+# Get images
+loop=0
+for i in $(<${CERT_IMAGES_FILE}) $(<${ELEMENTAL_IMAGES_FILE}) $(<${RANCHER_IMAGES_FILE}); do
+  mkdir -p ${i%/*}
+
+  # Devel/Staging versions of Rancher are hosted in a specific registry
+  [[ "${i}" =~ (rancher/rancher-agent:|rancher/rancher:) && -n "${RANCHER_IMAGES_REPO}" ]] &&
+    j="${RANCHER_IMAGES_REPO}/${i}" ||
+    j="${i}"
+
+  # Copy images
+  RunSkopeoCmdWithRetry copy docker://${j} docker-archive:${i/:/_}.tar:${i} &
+
+  # Wait for skopeo jobs to finish if we already have too much jobs in parallel
+  # This is to avoid the "too many requests to registry" error!
+  if ((++loop > 50)); then
+    echo "Wait for sync..."
+    wait
+
+    # Reset loop counter
+    loop=0
+  fi
+done
+
+# Wait for *ALL* skopeo jobs to finish
+wait
+
+# Skopeo - Registry
+RunSkopeoCmdWithRetry copy --additional-tag registry:latest docker://registry:latest docker-archive:registry/registry.tar
+
+# Compress all the things
+cd ${OPT_RANCHER}
+tar -I pzstd -vcf ${OPT_RANCHER%/*}/airgap_rancher.zst $(ls 2>/dev/null)
