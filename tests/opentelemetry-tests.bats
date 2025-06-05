@@ -41,15 +41,17 @@ export -f get_metrics # required by retry command
 
 @test "[OpenTelemetry] Install OpenTelemetry, Prometheus, Jaeger" {
     # Required by OpenTelemetry
-    helm repo add jetstack https://charts.jetstack.io --force-update
-    helm upgrade -i --wait cert-manager jetstack/cert-manager \
+    helm repo add e2e-jetstack https://charts.jetstack.io --force-update
+    helm upgrade -i --wait cert-manager e2e-jetstack/cert-manager \
         -n cert-manager --create-namespace \
         --set crds.enabled=true
 
     # OpemTelementry
     helm repo add --force-update open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+    # v0.86.4 - https://github.com/open-telemetry/opentelemetry-helm-charts/issues/1648
     helm upgrade -i --wait my-opentelemetry-operator open-telemetry/opentelemetry-operator \
         --set "manager.collectorImage.repository=otel/opentelemetry-collector-contrib" \
+        --version "${OTEL_OPERATOR:-0.86.4}" \
         -n open-telemetry --create-namespace
 
     # Prometheus

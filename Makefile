@@ -49,14 +49,23 @@ $(TESTFILES):
 	CLUSTER_CONTEXT=$(CLUSTER_CONTEXT) \
 	bats -T --print-output-on-failure $(TESTS_DIR)/$@
 
-# Target all non-destructive tests
-tests: $(filter-out audit-scanner-installation.bats, $(TESTFILES))
+# Filter out audit-scanner-installation because it reinstalls kubewarden
+FILTERED := $(filter-out audit-scanner-installation.bats, $(TESTFILES))
+# Filter out mutual-tls if MTLS is not set
+ifeq ($(MTLS),)
+    FILTERED := $(filter-out mutual-tls.bats, $(TESTFILES))
+endif
+# Target all standard tests
+tests: $(FILTERED)
 
 cluster:
 	./scripts/cluster_k3d.sh create
 
 install: check
 	./scripts/helmer.sh install
+
+rancher:
+	./scripts/rancher.sh install
 
 upgrade:
 	./scripts/helmer.sh upgrade
@@ -72,5 +81,8 @@ all: clean cluster install tests
 check:
 	@yq --version | grep mikefarah > /dev/null || { echo "yq is not the correct, needs mikefarah/yq!"; exit 1; }
 	@jq --version > /dev/null || { echo "jq is not installed!"; exit 1; }
+	@docker --version > /dev/null || { echo "docker is not installed!"; exit 1; }
 	@k3d --version > /dev/null || { echo "k3d is not installed!"; exit 1; }
-	@bats --version > /dev/null || { echo "bats is not installed!"; exit 1; }
+	@kubectl version --client > /dev/null || { echo "kubectl is not installed!"; exit 1; }
+	@helm version > /dev/null || { echo "helm is not installed!"; exit 1; }
+	@bats --version > /dev/null || { echo "bats is not installed!"; }
